@@ -81,7 +81,14 @@ pub fn process_connection(
         args,
         caps: initialize_params.capabilities,
     };
-    let server = Server::new(connection, config)?;
+    let enable_label_completions = config.args.enable_label_completions;
+    let mut server = Server::new(connection, config)?;
+
+    // Trigger async refresh of workspace targets if label completions are enabled
+    if enable_label_completions {
+        server.refresh_all_workspace_targets();
+    }
+
     server.run()
 }
 
