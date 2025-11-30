@@ -32,6 +32,7 @@ pub trait BazelClient: Send + Sync + 'static {
     fn null_query_external_repo_targets(&self, repo: &str) -> anyhow::Result<()>;
     fn repo_mapping_keys(&self, from_repo: &str) -> anyhow::Result<Vec<String>>;
     fn query_all_workspace_targets(&self) -> anyhow::Result<Vec<String>>;
+    fn query_external_repo_targets(&self, repo: &str) -> anyhow::Result<Vec<String>>;
     fn fetch_repo(&self, repo: &str) -> anyhow::Result<()>;
     fn dump_repo_mapping(&self, repo: &str) -> anyhow::Result<HashMap<String, String>>;
 }
@@ -197,9 +198,76 @@ impl BazelClient for BazelCLI {
     }
 
     fn query_all_workspace_targets(&self) -> anyhow::Result<Vec<String>> {
+        let mut all_targets = Vec::new();
+
         if self.use_buildozer {
-            // Use buildozer to query targets
+            // Use buildozer to query workspace targets
             let output = self.run_buildozer_command(["print label", "//...:*"])?;
+            let targets = str::from_utf8(&output)?
+                .lines()
+                .filter(|line| !line.is_empty())
+                .map(|line| line.to_string())
+                .collect::<Vec<_>>();
+            all_targets.extend(targets);
+        } else {
+            // Use bazel query for workspace targets
+            let output = self.run_command(["query", "kind('.* rule', ...)"])?;
+            let targets = str::from_utf8(&output)?
+                .lines()
+                .map(|line| line.to_string())
+                .collect::<Vec<_>>();
+            all_targets.extend(targets);
+        }
+
+        // Also query external repository targets
+        // Discover external repos by querying dependencies of workspace targets
+        // This will include external repo targets that are dependencies
+        if let Ok(output) = self.run_command([
+            "query",
+            "--keep_going",
+            "--output=label",
+            "deps(kind('.* rule', ...))",
+        ]) {
+            if let Ok(output_str) = str::from_utf8(&output) {
+                // Extract external repo names from dependencies
+                let mut external_repos = std::collections::HashSet::new();
+                let mut external_targets_from_deps = Vec::new();
+
+                for line in output_str.lines() {
+                    // Look for external repo targets (format: @repo_name//package:target)
+                    // Exclude @@ which is canonical repo name format
+                    if line.starts_with('@') && !line.starts_with("@@") {
+                        if let Some(repo_end) = line[1..].find("//") {
+                            let repo = &line[1..1 + repo_end];
+                            if !repo.is_empty() {
+                                external_repos.insert(repo.to_string());
+                                external_targets_from_deps.push(line.to_string());
+                            }
+                        }
+                    }
+                }
+
+                // Add external targets found in dependencies
+                all_targets.extend(external_targets_from_deps);
+
+                // Also query all targets from each discovered external repo
+                // This ensures we get all targets from external repos, not just dependencies
+                for repo in external_repos {
+                    if let Ok(external_targets) = self.query_external_repo_targets(&repo) {
+                        all_targets.extend(external_targets);
+                    }
+                }
+            }
+        }
+
+        Ok(all_targets)
+    }
+
+    fn query_external_repo_targets(&self, repo: &str) -> anyhow::Result<Vec<String>> {
+        if self.use_buildozer {
+            // Use buildozer to query external repo targets
+            let output =
+                self.run_buildozer_command(["print label", &format!("@{}//...:*", repo)])?;
             let targets = str::from_utf8(&output)?
                 .lines()
                 .filter(|line| !line.is_empty())
@@ -207,8 +275,13 @@ impl BazelClient for BazelCLI {
                 .collect();
             Ok(targets)
         } else {
-            // Use bazel query
-            let output = self.run_command(["query", "kind('.* rule', ...)"])?;
+            // Use bazel query for external repo targets
+            // Query targets from the external repository
+            let output = self.run_command([
+                "query",
+                "--keep_going",
+                &format!("kind('.* rule', @{}//...)", repo),
+            ])?;
             let targets = str::from_utf8(&output)?
                 .lines()
                 .map(|line| line.to_string())

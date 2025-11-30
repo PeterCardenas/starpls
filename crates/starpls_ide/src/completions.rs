@@ -319,17 +319,46 @@ pub(crate) fn completions(
         }
 
         CompletionAnalysis::String(StringContext::Label { file_id, text }) => {
-            if matches!(trigger_character.as_deref(), Some("@")) {
-                return None;
-            }
-
             let package = db.resolve_build_file(file_id).unwrap_or_default();
             // Check if this is a shorthand target (starting with ':' or '//:')
             let is_relative = text.starts_with(':') || text.starts_with("//:");
+            // Check if this is an external repository target (starting with '@repo_name//')
+            let is_external = text.starts_with('@') && text.contains("//");
+            // Check if we're typing an external repo name (starts with '@' but no '//' yet)
+            let is_typing_external_repo = text.starts_with('@') && !text.contains("//");
             let is_absolute = text.starts_with("//") && !text.starts_with("//:");
             let prefix = strip_last_package_or_target(&text);
             let has_target = text.contains(':');
             let mut seen_packages = HashSet::<&str>::new();
+
+            // If we're typing an external repo name (just '@' or '@repo_name'), show repo name completions
+            if is_typing_external_repo {
+                let mut seen_repos = HashSet::<&str>::new();
+                let repo_prefix = text.strip_prefix('@').unwrap_or("");
+
+                for target in db.get_all_workspace_targets().iter() {
+                    // Extract external repo names from targets (format: @repo_name//package:target)
+                    if target.starts_with('@') && !target.starts_with("@@") {
+                        if let Some(repo_end) = target[1..].find("//") {
+                            let repo = &target[1..1 + repo_end];
+                            if !repo.is_empty()
+                                && repo.starts_with(repo_prefix)
+                                && !seen_repos.contains(repo)
+                            {
+                                seen_repos.insert(repo);
+                                items.push(CompletionItem {
+                                    label: format!("@{}", repo),
+                                    kind: CompletionItemKind::Module,
+                                    mode: None,
+                                    relevance: CompletionRelevance::VariableOrKeyword,
+                                    filter_text: None,
+                                });
+                            }
+                        }
+                    }
+                }
+                return Some(items);
+            }
 
             for target in db.get_all_workspace_targets().iter() {
                 let remaining = match if is_relative {
@@ -344,6 +373,7 @@ pub(crate) fn completions(
                             .and_then(|res| res.strip_prefix(prefix))
                     }
                 } else {
+                    // For absolute or external repo targets, strip the prefix directly
                     target.strip_prefix(prefix)
                 } {
                     Some(remaining) => remaining,
@@ -354,9 +384,9 @@ pub(crate) fn completions(
                     let label = if is_relative {
                         // For shorthand targets, keep the ':' prefix
                         format!(":{}", remaining)
-                    } else if is_absolute {
-                        // For absolute targets, reconstruct the full label with '//' prefix
-                        // prefix already includes the package path and ':', so we just append remaining
+                    } else if is_external || is_absolute {
+                        // For external repo or absolute targets, reconstruct the full label with prefix
+                        // prefix already includes the repo name (for external) or package path (for absolute) and ':', so we just append remaining
                         format!("{}{}", prefix, remaining)
                     } else {
                         remaining.to_string()
@@ -375,9 +405,9 @@ pub(crate) fn completions(
                         let package = &remaining_trimmed[..index];
                         if !package.is_empty() && !seen_packages.contains(package) {
                             seen_packages.insert(package);
-                            let label = if is_absolute {
-                                // For absolute targets, reconstruct the full package path with '//' prefix
-                                // prefix already includes '//' and possibly part of the package path
+                            let label = if is_external || is_absolute {
+                                // For external repo or absolute targets, reconstruct the full package path with prefix
+                                // prefix already includes '@repo_name//' (for external) or '//' (for absolute) and possibly part of the package path
                                 if prefix.ends_with('/') {
                                     format!("{}{}", prefix, package)
                                 } else {
@@ -468,7 +498,7 @@ fn maybe_str_context(file_id: FileId, root: &SyntaxNode, pos: TextSize) -> Optio
 
         // Check if the current text is potentially a label.
         let text = text.value()?;
-        if text.starts_with("//") || text.starts_with(':') {
+        if text.starts_with("//") || text.starts_with(':') || text.starts_with('@') {
             return Some(StringContext::Label { file_id, text });
         }
     }
@@ -941,5 +971,225 @@ label = "//foo$0"
                 CompletionItem { label: "//foo", kind: Folder, mode: None, filter_text: None, relevance: VariableOrKeyword }
             "#]],
         );
+    }
+
+    #[test]
+    fn test_label_completions_external_repo() {
+        let (mut analysis, fixture) = Analysis::from_single_file_fixture(
+            r#"
+label = "@repo//$0"
+"#,
+        );
+        analysis.db.set_all_workspace_targets(
+            [
+                "//:foo",
+                "//:bar",
+                "@repo//package:target1",
+                "@repo//package:target2",
+                "@repo//other:target",
+            ]
+            .into_iter()
+            .map(String::from)
+            .collect(),
+        );
+
+        let completions = analysis
+            .snapshot()
+            .completions(
+                fixture
+                    .cursor_pos
+                    .map(|(file_id, pos)| FilePosition { file_id, pos })
+                    .unwrap(),
+                Some("".to_string()),
+            )
+            .unwrap()
+            .unwrap();
+
+        let mut completions = completions
+            .into_iter()
+            .filter(|item| {
+                item.relevance != CompletionRelevance::Builtin
+                    && item.kind != CompletionItemKind::Keyword
+            })
+            .collect::<Vec<_>>();
+        completions.sort_by(|item1, item2| item1.label.cmp(&item2.label));
+
+        let expected = completions
+            .into_iter()
+            .fold(String::new(), |mut acc, item| {
+                writeln!(acc, "{:?}", item).unwrap();
+                acc
+            });
+
+        expect![[r#"
+            CompletionItem { label: "@repo//other", kind: Folder, mode: None, filter_text: None, relevance: VariableOrKeyword }
+            CompletionItem { label: "@repo//package", kind: Folder, mode: None, filter_text: None, relevance: VariableOrKeyword }
+        "#]]
+        .assert_eq(&expected);
+    }
+
+    #[test]
+    fn test_label_completions_external_repo_name() {
+        let (mut analysis, fixture) = Analysis::from_single_file_fixture(
+            r#"
+label = "@$0"
+"#,
+        );
+        analysis.db.set_all_workspace_targets(
+            [
+                "//:foo",
+                "//:bar",
+                "@repo1//package:target1",
+                "@repo1//package:target2",
+                "@repo2//other:target",
+                "@another_repo//foo:bar",
+            ]
+            .into_iter()
+            .map(String::from)
+            .collect(),
+        );
+
+        let completions = analysis
+            .snapshot()
+            .completions(
+                fixture
+                    .cursor_pos
+                    .map(|(file_id, pos)| FilePosition { file_id, pos })
+                    .unwrap(),
+                Some("".to_string()),
+            )
+            .unwrap()
+            .unwrap();
+
+        let mut completions = completions
+            .into_iter()
+            .filter(|item| {
+                item.relevance != CompletionRelevance::Builtin
+                    && item.kind != CompletionItemKind::Keyword
+            })
+            .collect::<Vec<_>>();
+        completions.sort_by(|item1, item2| item1.label.cmp(&item2.label));
+
+        let expected = completions
+            .into_iter()
+            .fold(String::new(), |mut acc, item| {
+                writeln!(acc, "{:?}", item).unwrap();
+                acc
+            });
+
+        expect![[r#"
+            CompletionItem { label: "@another_repo", kind: Module, mode: None, filter_text: None, relevance: VariableOrKeyword }
+            CompletionItem { label: "@repo1", kind: Module, mode: None, filter_text: None, relevance: VariableOrKeyword }
+            CompletionItem { label: "@repo2", kind: Module, mode: None, filter_text: None, relevance: VariableOrKeyword }
+        "#]]
+        .assert_eq(&expected);
+    }
+
+    #[test]
+    fn test_label_completions_external_repo_name_partial() {
+        let (mut analysis, fixture) = Analysis::from_single_file_fixture(
+            r#"
+label = "@repo$0"
+"#,
+        );
+        analysis.db.set_all_workspace_targets(
+            [
+                "//:foo",
+                "@repo1//package:target1",
+                "@repo2//other:target",
+                "@another_repo//foo:bar",
+            ]
+            .into_iter()
+            .map(String::from)
+            .collect(),
+        );
+
+        let completions = analysis
+            .snapshot()
+            .completions(
+                fixture
+                    .cursor_pos
+                    .map(|(file_id, pos)| FilePosition { file_id, pos })
+                    .unwrap(),
+                Some("".to_string()),
+            )
+            .unwrap()
+            .unwrap();
+
+        let mut completions = completions
+            .into_iter()
+            .filter(|item| {
+                item.relevance != CompletionRelevance::Builtin
+                    && item.kind != CompletionItemKind::Keyword
+            })
+            .collect::<Vec<_>>();
+        completions.sort_by(|item1, item2| item1.label.cmp(&item2.label));
+
+        let expected = completions
+            .into_iter()
+            .fold(String::new(), |mut acc, item| {
+                writeln!(acc, "{:?}", item).unwrap();
+                acc
+            });
+
+        expect![[r#"
+            CompletionItem { label: "@repo1", kind: Module, mode: None, filter_text: None, relevance: VariableOrKeyword }
+            CompletionItem { label: "@repo2", kind: Module, mode: None, filter_text: None, relevance: VariableOrKeyword }
+        "#]]
+        .assert_eq(&expected);
+    }
+
+    #[test]
+    fn test_label_completions_external_repo_target() {
+        let (mut analysis, fixture) = Analysis::from_single_file_fixture(
+            r#"
+label = "@repo//package:t$0"
+"#,
+        );
+        analysis.db.set_all_workspace_targets(
+            [
+                "//:foo",
+                "@repo//package:target1",
+                "@repo//package:target2",
+                "@repo//other:target",
+            ]
+            .into_iter()
+            .map(String::from)
+            .collect(),
+        );
+
+        let completions = analysis
+            .snapshot()
+            .completions(
+                fixture
+                    .cursor_pos
+                    .map(|(file_id, pos)| FilePosition { file_id, pos })
+                    .unwrap(),
+                Some("".to_string()),
+            )
+            .unwrap()
+            .unwrap();
+
+        let mut completions = completions
+            .into_iter()
+            .filter(|item| {
+                item.relevance != CompletionRelevance::Builtin
+                    && item.kind != CompletionItemKind::Keyword
+            })
+            .collect::<Vec<_>>();
+        completions.sort_by(|item1, item2| item1.label.cmp(&item2.label));
+
+        let expected = completions
+            .into_iter()
+            .fold(String::new(), |mut acc, item| {
+                writeln!(acc, "{:?}", item).unwrap();
+                acc
+            });
+
+        expect![[r#"
+            CompletionItem { label: "@repo//package:target1", kind: Field, mode: None, filter_text: None, relevance: VariableOrKeyword }
+            CompletionItem { label: "@repo//package:target2", kind: Field, mode: None, filter_text: None, relevance: VariableOrKeyword }
+        "#]]
+        .assert_eq(&expected);
     }
 }
