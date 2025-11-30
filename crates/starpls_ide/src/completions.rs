@@ -324,17 +324,25 @@ pub(crate) fn completions(
             }
 
             let package = db.resolve_build_file(file_id).unwrap_or_default();
-            let is_relative = text.starts_with(':');
+            // Check if this is a shorthand target (starting with ':' or '//:')
+            let is_relative = text.starts_with(':') || text.starts_with("//:");
+            let is_absolute = text.starts_with("//") && !text.starts_with("//:");
             let prefix = strip_last_package_or_target(&text);
             let has_target = text.contains(':');
             let mut seen_packages = HashSet::<&str>::new();
 
             for target in db.get_all_workspace_targets().iter() {
                 let remaining = match if is_relative {
-                    target
-                        .strip_prefix("//")
-                        .and_then(|res| res.strip_prefix(&package))
-                        .and_then(|res| res.strip_prefix(prefix))
+                    // For shorthand targets starting with "//:", strip "//:" directly
+                    if prefix.starts_with("//:") {
+                        target.strip_prefix(prefix)
+                    } else {
+                        // For shorthand targets starting with ":", strip "//" and package, then the prefix
+                        target
+                            .strip_prefix("//")
+                            .and_then(|res| res.strip_prefix(&package))
+                            .and_then(|res| res.strip_prefix(prefix))
+                    }
                 } else {
                     target.strip_prefix(prefix)
                 } {
@@ -343,24 +351,49 @@ pub(crate) fn completions(
                 };
 
                 if has_target {
+                    let label = if is_relative {
+                        // For shorthand targets, keep the ':' prefix
+                        format!(":{}", remaining)
+                    } else if is_absolute {
+                        // For absolute targets, reconstruct the full label with '//' prefix
+                        // prefix already includes the package path and ':', so we just append remaining
+                        format!("{}{}", prefix, remaining)
+                    } else {
+                        remaining.to_string()
+                    };
                     items.push(CompletionItem {
-                        label: remaining.to_string(),
+                        label,
                         kind: CompletionItemKind::Field,
                         mode: None,
                         relevance: CompletionRelevance::VariableOrKeyword,
                         filter_text: None,
                     });
-                } else if let Some(index) = remaining.find(['/', ':']) {
-                    let package = &remaining[..index];
-                    if !package.is_empty() && !seen_packages.contains(package) {
-                        seen_packages.insert(package);
-                        items.push(CompletionItem {
-                            label: package.to_string(),
-                            kind: CompletionItemKind::Folder,
-                            mode: None,
-                            relevance: CompletionRelevance::VariableOrKeyword,
-                            filter_text: None,
-                        });
+                } else {
+                    // Strip leading '/' if present (can happen when prefix doesn't end with '/')
+                    let remaining_trimmed = remaining.strip_prefix('/').unwrap_or(remaining);
+                    if let Some(index) = remaining_trimmed.find(['/', ':']) {
+                        let package = &remaining_trimmed[..index];
+                        if !package.is_empty() && !seen_packages.contains(package) {
+                            seen_packages.insert(package);
+                            let label = if is_absolute {
+                                // For absolute targets, reconstruct the full package path with '//' prefix
+                                // prefix already includes '//' and possibly part of the package path
+                                if prefix.ends_with('/') {
+                                    format!("{}{}", prefix, package)
+                                } else {
+                                    format!("{}/{}", prefix.trim_end_matches('/'), package)
+                                }
+                            } else {
+                                package.to_string()
+                            };
+                            items.push(CompletionItem {
+                                label,
+                                kind: CompletionItemKind::Folder,
+                                mode: None,
+                                relevance: CompletionRelevance::VariableOrKeyword,
+                                filter_text: None,
+                            });
+                        }
                     }
                 }
             }
@@ -789,8 +822,8 @@ d["$0"]
 label = "//$0"
 "#,
             expect![[r#"
-                CompletionItem { label: "bar", kind: Folder, mode: None, filter_text: None, relevance: VariableOrKeyword }
-                CompletionItem { label: "foo", kind: Folder, mode: None, filter_text: None, relevance: VariableOrKeyword }
+                CompletionItem { label: "//bar", kind: Folder, mode: None, filter_text: None, relevance: VariableOrKeyword }
+                CompletionItem { label: "//foo", kind: Folder, mode: None, filter_text: None, relevance: VariableOrKeyword }
             "#]],
         );
     }
@@ -802,8 +835,8 @@ label = "//$0"
 label = "//fo$0"
 "#,
             expect![[r#"
-                CompletionItem { label: "bar", kind: Folder, mode: None, filter_text: None, relevance: VariableOrKeyword }
-                CompletionItem { label: "foo", kind: Folder, mode: None, filter_text: None, relevance: VariableOrKeyword }
+                CompletionItem { label: "//bar", kind: Folder, mode: None, filter_text: None, relevance: VariableOrKeyword }
+                CompletionItem { label: "//foo", kind: Folder, mode: None, filter_text: None, relevance: VariableOrKeyword }
             "#]],
         );
     }
@@ -815,8 +848,8 @@ label = "//fo$0"
 label = "//:$0"
 "#,
             expect![[r#"
-                CompletionItem { label: "bar", kind: Field, mode: None, filter_text: None, relevance: VariableOrKeyword }
-                CompletionItem { label: "foo", kind: Field, mode: None, filter_text: None, relevance: VariableOrKeyword }
+                CompletionItem { label: ":bar", kind: Field, mode: None, filter_text: None, relevance: VariableOrKeyword }
+                CompletionItem { label: ":foo", kind: Field, mode: None, filter_text: None, relevance: VariableOrKeyword }
             "#]],
         );
     }
@@ -828,8 +861,8 @@ label = "//:$0"
 label = "//:f$0"
 "#,
             expect![[r#"
-                CompletionItem { label: "bar", kind: Field, mode: None, filter_text: None, relevance: VariableOrKeyword }
-                CompletionItem { label: "foo", kind: Field, mode: None, filter_text: None, relevance: VariableOrKeyword }
+                CompletionItem { label: ":bar", kind: Field, mode: None, filter_text: None, relevance: VariableOrKeyword }
+                CompletionItem { label: ":foo", kind: Field, mode: None, filter_text: None, relevance: VariableOrKeyword }
             "#]],
         );
     }
@@ -841,7 +874,7 @@ label = "//:f$0"
 label = "//foo:$0"
 "#,
             expect![[r#"
-                CompletionItem { label: "foo", kind: Field, mode: None, filter_text: None, relevance: VariableOrKeyword }
+                CompletionItem { label: "//foo:foo", kind: Field, mode: None, filter_text: None, relevance: VariableOrKeyword }
             "#]],
         );
     }
@@ -853,7 +886,7 @@ label = "//foo:$0"
 label = "//foo/$0"
 "#,
             expect![[r#"
-                CompletionItem { label: "bar", kind: Folder, mode: None, filter_text: None, relevance: VariableOrKeyword }
+                CompletionItem { label: "//foo/bar", kind: Folder, mode: None, filter_text: None, relevance: VariableOrKeyword }
             "#]],
         );
     }
@@ -865,8 +898,47 @@ label = "//foo/$0"
 label = "//foo/bar:b$0"
 "#,
             expect![[r#"
-                CompletionItem { label: "bar", kind: Field, mode: None, filter_text: None, relevance: VariableOrKeyword }
-                CompletionItem { label: "baz", kind: Field, mode: None, filter_text: None, relevance: VariableOrKeyword }
+                CompletionItem { label: "//foo/bar:bar", kind: Field, mode: None, filter_text: None, relevance: VariableOrKeyword }
+                CompletionItem { label: "//foo/bar:baz", kind: Field, mode: None, filter_text: None, relevance: VariableOrKeyword }
+            "#]],
+        );
+    }
+
+    #[test]
+    fn test_label_completions_shorthand_target() {
+        check_completions(
+            r#"
+label = ":$0"
+"#,
+            expect![[r#"
+                CompletionItem { label: ":bar", kind: Field, mode: None, filter_text: None, relevance: VariableOrKeyword }
+                CompletionItem { label: ":foo", kind: Field, mode: None, filter_text: None, relevance: VariableOrKeyword }
+            "#]],
+        );
+    }
+
+    #[test]
+    fn test_label_completions_shorthand_target_partial() {
+        check_completions(
+            r#"
+label = ":f$0"
+"#,
+            expect![[r#"
+                CompletionItem { label: ":bar", kind: Field, mode: None, filter_text: None, relevance: VariableOrKeyword }
+                CompletionItem { label: ":foo", kind: Field, mode: None, filter_text: None, relevance: VariableOrKeyword }
+            "#]],
+        );
+    }
+
+    #[test]
+    fn test_label_completions_absolute_package() {
+        check_completions(
+            r#"
+label = "//foo$0"
+"#,
+            expect![[r#"
+                CompletionItem { label: "//bar", kind: Folder, mode: None, filter_text: None, relevance: VariableOrKeyword }
+                CompletionItem { label: "//foo", kind: Folder, mode: None, filter_text: None, relevance: VariableOrKeyword }
             "#]],
         );
     }
